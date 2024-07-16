@@ -3,7 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    loader::ast::{DatatypeInfo, DatatypeTagType, Function, LoadedModule},
+    loader::{
+        arena::Arena,
+        ast::{DatatypeInfo, DatatypeTagType, Function, LoadedModule},
+    },
     logging::expect_no_verification_errors,
     native_functions::NativeFunctions,
     session::LoadedFunctionInstantiation,
@@ -12,10 +15,10 @@ use move_binary_format::{
     errors::{verification_error, Location, PartialVMError, PartialVMResult, VMResult},
     file_format::{
         AbilitySet, CompiledModule, Constant, ConstantPoolIndex, EnumDefinitionIndex,
-        FieldHandleIndex, FieldInstantiationIndex, FunctionDefinitionIndex, FunctionHandleIndex,
-        FunctionInstantiationIndex, SignatureIndex, SignatureToken, StructDefInstantiationIndex,
-        StructDefinitionIndex, StructFieldInformation, TableIndex, TypeParameterIndex,
-        VariantHandleIndex, VariantInstantiationHandleIndex, VariantTag,
+        FieldHandleIndex, FieldInstantiationIndex, FunctionHandleIndex, FunctionInstantiationIndex,
+        SignatureIndex, SignatureToken, StructDefInstantiationIndex, StructDefinitionIndex,
+        StructFieldInformation, TableIndex, TypeParameterIndex, VariantHandleIndex,
+        VariantInstantiationHandleIndex, VariantTag,
     },
     IndexKind,
 };
@@ -46,6 +49,7 @@ use std::{
 };
 use tracing::error;
 
+pub mod arena;
 pub mod ast;
 pub mod translate;
 
@@ -121,7 +125,9 @@ pub struct ModuleCache {
     /// Global cache of loaded datatypes, shared among all modules.
     datatypes: BinaryCache<(ModuleId, Identifier), CachedDatatype>,
     /// Global list of loaded functions, shared among all modules.
-    functions: Vec<Arc<Function>>,
+    functions: Vec<*const Function>,
+    /// Load Arena, where we hold functions and bytecode after translation.
+    arena: Arena,
 }
 
 /// Tracks the current end point of the `ModuleCache`'s `types`s and `function`s, so that we can
@@ -139,6 +145,7 @@ impl ModuleCache {
             loaded_modules: BinaryCache::new(),
             datatypes: BinaryCache::new(),
             functions: vec![],
+            arena: Arena::new(),
         }
     }
 
@@ -165,8 +172,8 @@ impl ModuleCache {
     }
 
     // Retrieve a function by index
-    fn function_at(&self, idx: usize) -> Arc<Function> {
-        Arc::clone(&self.functions[idx])
+    fn function_at(&self, idx: usize) -> *const Function {
+        self.functions[idx]
     }
 
     // Retrieve a declared type by index
@@ -405,13 +412,16 @@ impl ModuleCache {
             }
         }
 
+        /*
         for (idx, func) in module.function_defs().iter().enumerate() {
             let findex = FunctionDefinitionIndex(idx as TableIndex);
             let function = translate::function(natives, findex, func, module);
             self.functions.push(Arc::new(function));
         }
+        */
 
-        let loaded_module = translate::module(cursor, link_context, storage_id, module, self)?;
+        let loaded_module =
+            translate::module(cursor, natives, link_context, storage_id, module, self)?;
         self.loaded_modules
             .insert((link_context, runtime_id), loaded_module)
     }
@@ -587,7 +597,7 @@ impl ModuleCache {
         func_name: &IdentStr,
         runtime_id: &ModuleId,
         link_context: AccountAddress,
-    ) -> PartialVMResult<usize> {
+    ) -> PartialVMResult<*const Function> {
         match self
             .loaded_modules
             .get(&(link_context, runtime_id.clone()))
@@ -852,20 +862,21 @@ impl Loader {
     ) -> VMResult<(
         Arc<CompiledModule>,
         Arc<LoadedModule>,
-        Arc<Function>,
+        *const Function,
         LoadedFunctionInstantiation,
     )> {
         let link_context = data_store.link_context();
         let (compiled, loaded) = self.load_module(runtime_id, data_store)?;
-        let idx = self
+        let function = self
             .module_cache
             .read()
             .resolve_function_by_name(function_name, runtime_id, link_context)
             .map_err(|err| err.finish(Location::Undefined))?;
-        let func = self.module_cache.read().function_at(idx);
+
+        let fun_ref = arena::to_ref(function);
 
         let parameters = compiled
-            .signature_at(func.parameters)
+            .signature_at(fun_ref.parameters)
             .0
             .iter()
             .map(|tok| self.module_cache.read().make_type(&compiled, tok))
@@ -873,7 +884,7 @@ impl Loader {
             .map_err(|err| err.finish(Location::Undefined))?;
 
         let return_ = compiled
-            .signature_at(func.return_)
+            .signature_at(fun_ref.return_)
             .0
             .iter()
             .map(|tok| self.module_cache.read().make_type(&compiled, tok))
@@ -881,14 +892,14 @@ impl Loader {
             .map_err(|err| err.finish(Location::Undefined))?;
 
         // verify type arguments
-        self.verify_ty_args(func.type_parameters(), ty_args)
+        self.verify_ty_args(fun_ref.type_parameters(), ty_args)
             .map_err(|e| e.finish(Location::Module(runtime_id.clone())))?;
 
         let inst = LoadedFunctionInstantiation {
             parameters,
             return_,
         };
-        Ok((compiled, loaded, func, inst))
+        Ok((compiled, loaded, function, inst))
     }
 
     // Entry point for module publishing (`MoveVM::publish_module_bundle`).
@@ -1384,7 +1395,7 @@ impl Loader {
     // Internal helpers
     //
 
-    fn function_at(&self, idx: usize) -> Arc<Function> {
+    fn function_at(&self, idx: usize) -> *const Function {
         self.module_cache.read().function_at(idx)
     }
 
@@ -1498,17 +1509,16 @@ impl<'a> Resolver<'a> {
     // Function resolution
     //
 
-    pub(crate) fn function_from_handle(&self, idx: FunctionHandleIndex) -> Arc<Function> {
-        let idx = self.binary.loaded.function_at(idx.0);
-        self.loader.function_at(idx)
+    pub(crate) fn function_from_handle(&self, idx: FunctionHandleIndex) -> *const Function {
+        self.binary.loaded.function_at(idx.0)
     }
 
     pub(crate) fn function_from_instantiation(
         &self,
         idx: FunctionInstantiationIndex,
-    ) -> Arc<Function> {
+    ) -> *const Function {
         let func_inst = self.binary.loaded.function_instantiation_at(idx.0);
-        self.loader.function_at(func_inst.handle)
+        func_inst.handle
     }
 
     pub(crate) fn instantiate_generic_function(
