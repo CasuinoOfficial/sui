@@ -1,7 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import { isSerializedBcs, type BcsType, type SerializedBcs } from '@mysten/bcs';
+import { isSerializedBcs } from '@mysten/bcs';
+import type { BcsType, SerializedBcs } from '@mysten/bcs';
 
 import { bcs } from '../bcs/index.js';
 import type { Argument } from './data/internal.js';
@@ -28,7 +29,7 @@ export function createPure(makePure: (value: SerializedBcs<any, any> | Uint8Arra
 			return makePure(schemaFromName(typeOrSerializedValue).serialize(value as never));
 		}
 
-		if (typeOrSerializedValue instanceof Uint8Array && isSerializedBcs(typeOrSerializedValue)) {
+		if (typeOrSerializedValue instanceof Uint8Array || isSerializedBcs(typeOrSerializedValue)) {
 			return makePure(typeOrSerializedValue);
 		}
 
@@ -77,18 +78,18 @@ export type PureTypeName = BasePureType | `vector<${string}>` | `option<${string
 export type ValidPureTypeName<T extends string> = T extends BasePureType
 	? PureTypeName
 	: T extends `vector<${infer U}>`
-	? ValidPureTypeName<U>
-	: T extends `option<${infer U}>`
-	? ValidPureTypeName<U>
-	: PureTypeValidationError<T>;
+		? ValidPureTypeName<U>
+		: T extends `option<${infer U}>`
+			? ValidPureTypeName<U>
+			: PureTypeValidationError<T>;
 
 type ShapeFromPureTypeName<T extends PureTypeName> = T extends BasePureType
 	? Parameters<ReturnType<typeof createPure>[T]>[0]
 	: T extends `vector<${infer U extends PureTypeName}>`
-	? ShapeFromPureTypeName<U>[]
-	: T extends `option<${infer U extends PureTypeName}>`
-	? ShapeFromPureTypeName<U> | null
-	: never;
+		? ShapeFromPureTypeName<U>[]
+		: T extends `option<${infer U extends PureTypeName}>`
+			? ShapeFromPureTypeName<U> | null
+			: never;
 
 type PureTypeValidationError<T extends string> = T & {
 	error: `Invalid Pure type name: ${T}`;
